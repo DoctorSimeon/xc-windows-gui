@@ -1,0 +1,111 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_xc_native:
+        description: "Prova anche la compilazione nativa di XC con MSYS2 (sperimentale)"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) GUI -> XCConnections.exe  (affidabile: PySide6 + PyInstaller)
+  # ---------------------------------------------------------------------------
+  gui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installa dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Compila l'eseguibile
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name XCConnections
+          --add-data "xc_gui/templates;templates"
+          xc_gui/app.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XCConnections-gui
+          path: dist/XCConnections.exe
+
+  # ---------------------------------------------------------------------------
+  # 2) XC nativo su Windows con MSYS2  (SPERIMENTALE, puo' fallire)
+  #    XC documenta solo l'installazione su Linux. La catena di build e'
+  #    xc_basic -> xc_utils -> xc (CMake). L'elenco dei pacchetti qui sotto e'
+  #    un punto di partenza: servira' correggerlo leggendo i log degli errori.
+  # ---------------------------------------------------------------------------
+  xc-native:
+    if: ${{ github.event.inputs.build_xc_native == 'true' }}
+    runs-on: windows-latest
+    continue-on-error: true
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-gmp
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-numpy
+            mingw-w64-ucrt-x86_64-python-scipy
+
+      - name: Scarica i sorgenti
+        run: |
+          git clone --depth 1 https://github.com/xcfem/xc_basic
+          git clone --depth 1 https://github.com/xcfem/xc_utils
+          git clone --depth 1 https://github.com/xcfem/xc
+
+      - name: Compila xc_basic
+        run: |
+          cmake -S xc_basic/src -B build-xc_basic -G Ninja -DCMAKE_INSTALL_PREFIX=$MINGW_PREFIX
+          cmake --build build-xc_basic
+          cmake --install build-xc_basic
+
+      - name: Compila xc_utils
+        run: |
+          cmake -S xc_utils/src -B build-xc_utils -G Ninja -DCMAKE_INSTALL_PREFIX=$MINGW_PREFIX
+          cmake --build build-xc_utils
+          cmake --install build-xc_utils
+
+      - name: Compila XC
+        run: |
+          cmake -S xc/src -B build-xc -G Ninja -DCMAKE_INSTALL_PREFIX=$MINGW_PREFIX
+          cmake --build build-xc
+          cmake --install build-xc
+
+      - name: Raccogli i log di build
+        if: always()
+        run: |
+          mkdir -p logs
+          cp -r build-xc*/CMakeFiles/CMakeError.log logs/ 2>/dev/null || true
+          cp -r build-xc*/CMakeFiles/CMakeOutput.log logs/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xc-native-logs
+          path: logs/
+          if-no-files-found: ignore
