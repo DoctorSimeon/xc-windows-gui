@@ -1,0 +1,9 @@
+{
+  "beam": "IPE 300",
+  "column": "HEA 240",
+  "steel": "S355",
+  "code": "NTC",
+  "plate": {"t": 20.0, "width": 200.0, "height": 400.0, "weld_throat": 6.0, "y_first": 30.0},
+  "bolts": {"diameter": "M20", "grade": "8.8", "rows": 3, "p1": 80.0, "p2": 100.0, "per_row": 2},
+  "loads": {"N": 0.0, "V": 80.0, "M": 120.0}
+}
