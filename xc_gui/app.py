@@ -4,6 +4,8 @@ Interfaccia grafica (PySide6) che raccoglie i dati di un nodo trave-colonna con
 piastra di testa, genera uno script Python per XC (https://github.com/xcfem/xc)
 e lo esegue tramite un "backend" configurabile:
 
+  - Interno (EC3): motore analitico incluso nell'eseguibile (metodo delle
+                   componenti EN 1993-1-8); non richiede Python, WSL o Docker
   - Locale : un interprete Python con XC installato (python -)
   - WSL    : wsl.exe python3 -   (XC installato dentro WSL2)
   - Docker : docker run --rm -i <immagine> python3 -
@@ -46,6 +48,28 @@ from PySide6.QtWidgets import (
 )
 
 
+try:  # eseguito come pacchetto (python -m xc_gui.app)
+    from xc_gui.ec3 import render_report, run as run_ec3
+except ImportError:  # eseguito come script o da eseguibile PyInstaller
+    from ec3 import render_report, run as run_ec3
+
+INTERNAL_BACKEND = "Interno (EC3)"
+
+
+def decode_output(raw: bytes) -> str:
+    """Decodifica l'output di un processo: UTF-8, altrimenti la codifica della console."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for enc in (("oem", "mbcs") if sys.platform == "win32" else ()):
+        try:
+            return raw.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
 def resource_path(relative: str) -> Path:
     """Percorso di una risorsa, anche dentro un eseguibile PyInstaller."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -73,11 +97,12 @@ class JointInput:
     bolt_gauge: float = 100.0
     bolt_pitch: float = 80.0
     weld_throat: float = 6.0
+    plate_y_first: float = 30.0  # distanza 1a fila dal bordo superiore piastra [mm]
     axial_force: float = 0.0   # N  [kN], trazione positiva
     shear_force: float = 80.0  # V  [kN]
     bending_moment: float = 120.0  # M  [kNm]
     # backend
-    backend: str = "Locale"
+    backend: str = INTERNAL_BACKEND
     python_cmd: str = "python"
     docker_image: str = "xcfem/xc"
     extra: dict = field(default_factory=dict)
@@ -97,7 +122,40 @@ class JointInput:
             )
         if self.bolt_gauge + 2 * 1.2 * self.bolt_diameter > self.plate_width:
             errors.append("L'interasse orizzontale dei bulloni non entra nella piastra.")
+        last_row = self.plate_y_first + (self.bolt_rows - 1) * self.bolt_pitch
+        if last_row + 1.2 * self.bolt_diameter > self.plate_height:
+            errors.append("Le file di bulloni, a partire dalla distanza indicata dal "
+                          "bordo superiore, non entrano nell'altezza della piastra.")
         return errors
+
+    def to_engine_input(self) -> dict:
+        """Dati nel formato del motore interno EC3."""
+        return {
+            "beam": self.beam_profile,
+            "column": self.column_profile,
+            "steel": self.steel_grade,
+            "code": "NTC",
+            "plate": {
+                "t": self.plate_thickness,
+                "width": self.plate_width,
+                "height": self.plate_height,
+                "weld_throat": self.weld_throat,
+                "y_first": self.plate_y_first,
+            },
+            "bolts": {
+                "diameter": f"M{self.bolt_diameter}",
+                "grade": self.bolt_class,
+                "rows": self.bolt_rows,
+                "p1": self.bolt_pitch,
+                "p2": self.bolt_gauge,
+                "per_row": 2,
+            },
+            "loads": {
+                "N": self.axial_force,
+                "V": self.shear_force,
+                "M": self.bending_moment,
+            },
+        }
 
 
 def render_script(data: JointInput) -> str:
@@ -188,11 +246,13 @@ class MainWindow(QMainWindow):
         self.rows.setValue(d.bolt_rows)
         self.gauge = self._spin(d.bolt_gauge, 40, 400, 5, 0, "mm")
         self.pitch = self._spin(d.bolt_pitch, 40, 300, 5, 0, "mm")
+        self.y_first = self._spin(d.plate_y_first, 10, 600, 5, 0, "mm")
         f.addRow("Diametro", self.bd)
         f.addRow("Classe", self.bc)
         f.addRow("File", self.rows)
         f.addRow("Interasse orizzontale", self.gauge)
         f.addRow("Passo verticale", self.pitch)
+        f.addRow("1a fila dal bordo sup.", self.y_first)
         layout.addWidget(g_bolts)
 
         g_loads = QGroupBox("Sollecitazioni di progetto")
@@ -205,15 +265,18 @@ class MainWindow(QMainWindow):
         f.addRow("M", self.m)
         layout.addWidget(g_loads)
 
-        g_backend = QGroupBox("Esecuzione di XC")
+        g_backend = QGroupBox("Motore di calcolo")
         f = QFormLayout(g_backend)
         self.backend = QComboBox()
-        self.backend.addItems(["Locale", "WSL", "Docker"])
+        self.backend.addItems([INTERNAL_BACKEND, "Locale", "WSL", "Docker"])
+        self.backend.setCurrentText(d.backend)
         self.pycmd = QLineEdit(d.python_cmd)
         self.image = QLineEdit(d.docker_image)
         f.addRow("Modalita'", self.backend)
         f.addRow("Comando Python (Locale)", self.pycmd)
         f.addRow("Immagine Docker", self.image)
+        self.backend.currentTextChanged.connect(self._backend_changed)
+        self._backend_changed(self.backend.currentText())
         layout.addWidget(g_backend)
 
         row = QHBoxLayout()
@@ -234,7 +297,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         buttons = QHBoxLayout()
         self.btn_preview = QPushButton("Genera script")
-        self.btn_run = QPushButton("Esegui con XC")
+        self.btn_run = QPushButton("Esegui")
+        self.btn_run.setToolTip(
+            "Esegue la verifica con il motore selezionato (Interno EC3, oppure XC)")
         self.btn_stop = QPushButton("Interrompi")
         self.btn_stop.setEnabled(False)
         self.btn_preview.clicked.connect(self.preview_script)
@@ -274,6 +339,7 @@ class MainWindow(QMainWindow):
             bolt_gauge=self.gauge.value(),
             bolt_pitch=self.pitch.value(),
             weld_throat=self.weld.value(),
+            plate_y_first=self.y_first.value(),
             axial_force=self.n.value(),
             shear_force=self.v.value(),
             bending_moment=self.m.value(),
@@ -295,6 +361,7 @@ class MainWindow(QMainWindow):
         self.gauge.setValue(d.bolt_gauge)
         self.pitch.setValue(d.bolt_pitch)
         self.weld.setValue(d.weld_throat)
+        self.y_first.setValue(d.plate_y_first)
         self.n.setValue(d.axial_force)
         self.v.setValue(d.shear_force)
         self.m.setValue(d.bending_moment)
@@ -327,6 +394,27 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, TypeError) as exc:
             QMessageBox.critical(self, "Errore", f"File non valido:\n{exc}")
 
+    def _backend_changed(self, name: str) -> None:
+        self.pycmd.setEnabled(name == "Locale")
+        self.image.setEnabled(name == "Docker")
+
+    def _run_internal(self) -> None:
+        """Verifica con il motore EC3 incluso: nessun processo esterno."""
+        data = self.collect()
+        errors = data.validate()
+        if errors:
+            QMessageBox.warning(self, "Dati non validi", "\n".join(errors))
+            return
+        inp = data.to_engine_input()
+        try:
+            result = run_ec3(inp, "ec3")
+        except (ValueError, KeyError) as exc:
+            QMessageBox.critical(self, "Verifica non eseguibile", str(exc))
+            return
+        self.log_view.setPlainText(render_report(inp, result))
+        self.tabs.setCurrentIndex(1)
+        self.statusBar().showMessage(f"Esito: {result['overall']}")
+
     def _checked_script(self) -> str | None:
         data = self.collect()
         errors = data.validate()
@@ -343,6 +431,9 @@ class MainWindow(QMainWindow):
 
     def run_script(self) -> None:
         if self.process is not None:
+            return
+        if self.backend.currentText() == INTERNAL_BACKEND:
+            self._run_internal()
             return
         script = self._checked_script()
         if script is None:
@@ -373,9 +464,7 @@ class MainWindow(QMainWindow):
 
     def _read_output(self) -> None:
         if self.process is not None:
-            text = bytes(self.process.readAllStandardOutput()).decode(
-                "utf-8", errors="replace"
-            )
+            text = decode_output(bytes(self.process.readAllStandardOutput()))
             self.log_view.appendPlainText(text.rstrip("\n"))
 
     def _finished(self, code: int, _status) -> None:
